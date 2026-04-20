@@ -1,0 +1,399 @@
+{
+  "name": "Unstract Polling Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment filename:pdf is:unread"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -432,
+        496
+      ],
+      "id": "eb7a120f-f399-4c8e-9dbb-c2d9837a1658",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "FFJi4HY5ozILBf4t",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputDataFieldName": "attachment_0",
+        "name": "={{$binary.attachment_0.fileName}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1uZeBrVr76hlEBvJCZ0A0NWOlV9hehXr1",
+          "mode": "list",
+          "cachedResultName": "Invoices",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1uZeBrVr76hlEBvJCZ0A0NWOlV9hehXr1"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        448,
+        672
+      ],
+      "id": "2ca14b0b-f87e-4ab0-bc67-5e52f0e06db4",
+      "name": "Upload file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "oBKdsDJjchGRWHu0",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{$item(0).$node[\"Gmail Trigger\"].json[\"id\"]}}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        672,
+        608
+      ],
+      "id": "f1cd9820-ada5-4244-96af-33e78d99847f",
+      "name": "Mark a message as read",
+      "webhookId": "44b364be-68d9-47b2-b578-443d9ad2fee3",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "FFJi4HY5ozILBf4t",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get input data\nlet data = $input.first().json;\n\n// Case 1: Unstract full API response\nif (data.message && data.message.result) {\n  data = data.message.result[0].result.output;\n}\n\n// Case 2: Array response\nif (Array.isArray(data)) {\n  data = data[0];\n}\n\n// Flatten line items if wrapped\nif (data.items_table?.line_items) {\n  data.line_items = data.items_table.line_items;\n  delete data.items_table;\n}\n\n// Ensure numeric values\ndata.subtotal = Number(data.subtotal);\ndata.cgst = Number(data.cgst);\ndata.sgst = Number(data.sgst);\ndata.tax_total = Number(data.tax_total);\ndata.total_amount = Number(data.total_amount);\n\n// Normalize line items\ndata.line_items = (data.line_items || []).map(item => ({\n  item_number: Number(item.item_number),\n  description: item.description,\n  hsn_sac: String(item.hsn_sac),\n  quantity: Number(item.quantity),\n  unit: item.unit,\n  unit_price: Number(item.unit_price),\n  amount: Number(item.amount)\n}));\n\nreturn [{ json: data }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        352
+      ],
+      "id": "f6f3730a-8b57-4686-a6b1-5c7cc8eeaddd",
+      "name": "Parse JSON"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://us-central.unstract.com/deployment/api/org_TSHGtT6qBKqdMjm1/invoice_extract_1775115851728",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer 1ade660f-7a3f-4642-99ed-8567ee832333"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "timeout",
+              "value": "300"
+            },
+            {
+              "name": "include_metadata",
+              "value": "False"
+            },
+            {
+              "name": "include_metrics",
+              "value": "False"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        464,
+        352
+      ],
+      "id": "ac0f8e85-cf1d-41b4-8f95-3a7187814036",
+      "name": "HTTP Request to Unstract"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://192.168.200.11:8000/verification/invoice",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        848,
+        352
+      ],
+      "id": "6ac5f64d-178e-44e2-a14e-08fbee85364a",
+      "name": "Backend Service"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.id }}",
+        "labelIds": [
+          "Label_8028636318980244919"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        496,
+        848
+      ],
+      "id": "f23b10ba-5a31-4d26-88bd-36ea8d90468e",
+      "name": "Add label to message",
+      "webhookId": "a56eb971-0753-4717-913a-f8d0b1149778",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "FFJi4HY5ozILBf4t",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [
+        304,
+        368
+      ],
+      "id": "c61856d5-6317-4787-a027-4ef42fa5cd0c"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://192.168.200.11:8000/verification/email_metrics",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        320,
+        176
+      ],
+      "id": "e8ca8be0-4231-4959-88fd-fcf18c509948",
+      "name": "Invoice_counter"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nconst binary = item.binary || {};\nconst count = Object.keys(binary).length;\n\nreturn [{\n  json: {\n    metrics_type: \"invoice_email_metrics\",\n    total_invoices_received: count\n  },\n  binary: binary\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        96,
+        176
+      ],
+      "id": "65698f29-cd2b-4bc1-b0d5-87899a6427e5",
+      "name": "Count Function"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst output = [];\n\nfor (const item of items) {\n  if (!item.binary) continue;\n\n  for (const key of Object.keys(item.binary)) {\n    output.push({\n      json: item.json,\n      binary: {\n        data: item.binary[key]\n      }\n    });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        112,
+        384
+      ],
+      "id": "af7d9c1c-3d00-402b-a17c-8fc34d20d534",
+      "name": "Iterate into batches"
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  if (!item.binary) return item;\n\n  const newBinary = {};\n\n  for (const key of Object.keys(item.binary)) {\n    const file = item.binary[key];\n\n    if (file.mimeType === 'application/pdf') {\n      newBinary[key] = file;\n    }\n  }\n\n  item.binary = newBinary;\n  return item;\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        400
+      ],
+      "id": "73a75b97-8632-4604-88cc-cb5a6a5c092a",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Upload file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Add label to message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Count Function",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload file": {
+      "main": [
+        [
+          {
+            "node": "Mark a message as read",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark a message as read": {
+      "main": [
+        []
+      ]
+    },
+    "Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Backend Service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request to Unstract": {
+      "main": [
+        [
+          {
+            "node": "Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backend Service": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request to Unstract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count Function": {
+      "main": [
+        [
+          {
+            "node": "Invoice_counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Iterate into batches": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Iterate into batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "fbf602d1-5fc6-480e-bbe8-fc9c80b87c6e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "5ae2bd0b9abe1e1171d6ad93e402f5e6e1de8ca73def344eb0fb86861b85be09"
+  },
+  "id": "YCFjpNqyjnUwl1LJ",
+  "tags": []
+}
