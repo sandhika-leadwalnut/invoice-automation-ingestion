@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the application port
-EXPOSE 8069
+EXPOSE 8002
 
 # Command to run the background service and FastAPI
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8069"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
