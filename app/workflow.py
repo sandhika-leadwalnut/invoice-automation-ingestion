@@ -122,6 +122,8 @@ def process_message(msg_id: str, gmail_service, drive_service):
                 raw_json = unstract_resp.json()
                 # 7 & 8 Parse JSON and send to backend
                 parsed_data = parse_unstract_json(raw_json)
+                parsed_data["base64_pdf"] = base64.b64encode(pdf_data).decode('utf-8')
+                parsed_data["pdf_filename"] = filename
                 requests.post(f"{BACKEND_URL}/verification/invoice", json=parsed_data)
                 logger.info(f"Successfully processed {filename} and sent to Verification")
             else:
