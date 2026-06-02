@@ -9,9 +9,12 @@ def parse_unstract_json(data: dict) -> dict:
         data = data[0]
 
     # Flatten line items if wrapped
-    if "items_table" in data and isinstance(data["items_table"], dict):
-        if "line_items" in data["items_table"]:
-            data["line_items"] = data["items_table"]["line_items"]
+    if "items_table" in data:
+        if isinstance(data["items_table"], dict):
+            if "line_items" in data["items_table"]:
+                data["line_items"] = data["items_table"]["line_items"]
+        elif isinstance(data["items_table"], list):
+            data["line_items"] = data["items_table"]
         del data["items_table"]
     
     # Ensure numeric values
@@ -21,9 +24,15 @@ def parse_unstract_json(data: dict) -> dict:
         except ValueError:
             return 0.0
 
+    # Clean GSTIN fields
+    for field in ["buyer_gstin", "vendor_gstin"]:
+        if data.get(field) and isinstance(data[field], str):
+            data[field] = data[field].replace("GSTIN:", "").replace("GSTIN", "").strip()
+
     data["subtotal"] = parse_number(data.get("subtotal"))
     data["cgst"] = parse_number(data.get("cgst"))
     data["sgst"] = parse_number(data.get("sgst"))
+    data["igst"] = parse_number(data.get("igst"))
     data["tax_total"] = parse_number(data.get("tax_total"))
     data["total_amount"] = parse_number(data.get("total_amount"))
 
