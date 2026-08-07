@@ -6,6 +6,7 @@ from io import BytesIO
 from googleapiclient.http import MediaIoBaseUpload
 from app.oauth import get_gmail_service, get_drive_service
 from app.parsers import parse_unstract_json
+from app.drive_folders import move_file_to_vendor_folder
 
 logger = logging.getLogger(__name__)
 
@@ -85,18 +86,27 @@ def process_message(msg_id: str, gmail_service, drive_service):
         logger.error(f"Failed to post metrics: {e}")
 
     for filename, pdf_data in pdf_attachments:
-        # 4. Upload file to Drive
-        file_metadata = {
-            'name': filename,
-            'parents': [GOOGLE_DRIVE_FOLDER_ID]
-        }
+        parsed_data = None
+
+        # 4. Upload file to Drive immediately, into the root folder.
+        # The vendor is not known until Unstract has parsed the PDF, so the file
+        # is banked here first and re-parented into the vendor's folder in step 9.
+        # Uploading first means a parsing failure can never lose the document.
+        drive_file_id = None
         try:
+            file_metadata = {
+                'name': filename,
+                'parents': [GOOGLE_DRIVE_FOLDER_ID]
+            }
             media = MediaIoBaseUpload(BytesIO(pdf_data), mimetype='application/pdf', resumable=True)
-            drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            logger.info(f"Uploaded {filename} to Google Drive")
+            created = drive_service.files().create(
+                body=file_metadata, media_body=media, fields='id'
+            ).execute()
+            drive_file_id = created.get('id')
+            logger.info(f"Uploaded {filename} to Google Drive ({drive_file_id})")
         except Exception as e:
             logger.error(f"Failed to upload {filename} to drive: {e}")
-        
+
         # 6. HTTP Request to Unstract
         unstract_headers = {
             "Authorization": f"Bearer {UNSTRACT_API_KEY}"
@@ -109,13 +119,13 @@ def process_message(msg_id: str, gmail_service, drive_service):
         unstract_files = {
             "files": (filename, pdf_data, "application/pdf")
         }
-        
+
         try:
             logger.info(f"Sending {filename} to Unstract for parsing")
             unstract_resp = requests.post(
-                UNSTRACT_URL, 
-                headers=unstract_headers, 
-                data=unstract_data, 
+                UNSTRACT_URL,
+                headers=unstract_headers,
+                data=unstract_data,
                 files=unstract_files
             )
             if unstract_resp.status_code == 200:
@@ -124,12 +134,30 @@ def process_message(msg_id: str, gmail_service, drive_service):
                 parsed_data = parse_unstract_json(raw_json)
                 parsed_data["base64_pdf"] = base64.b64encode(pdf_data).decode('utf-8')
                 parsed_data["pdf_filename"] = filename
+                # Durable link between the invoice record and the Drive file.
+                # Filenames collide and get renamed; this id does not.
+                parsed_data["drive_file_id"] = drive_file_id
                 requests.post(f"{BACKEND_URL}/verification/invoice", json=parsed_data)
                 logger.info(f"Successfully processed {filename} and sent to Verification")
             else:
                 logger.error(f"Unstract failed for {filename}: {unstract_resp.status_code} - {unstract_resp.text}")
         except Exception as e:
             logger.error(f"Error calling Unstract or sending to Verification for {filename}: {e}")
+
+        # 9. Now that the vendor is known, move the file into its folder.
+        # Skipped entirely if the upload failed or parsing produced no vendor -
+        # in that case the file simply stays in the root folder.
+        if drive_file_id and parsed_data:
+            try:
+                move_file_to_vendor_folder(
+                    drive_service,
+                    drive_file_id,
+                    gstin=parsed_data.get("vendor_gstin"),
+                    vendor_name=parsed_data.get("vendor_name"),
+                    vendor_id=parsed_data.get("vendor_id"),
+                )
+            except Exception as e:
+                logger.error(f"Failed to file {filename} under its vendor folder: {e}")
 
     # 5. Add Label and mark message as read
     try:
