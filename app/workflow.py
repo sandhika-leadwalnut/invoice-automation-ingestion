@@ -137,6 +137,12 @@ def process_message(msg_id: str, gmail_service, drive_service):
                 # Durable link between the invoice record and the Drive file.
                 # Filenames collide and get renamed; this id does not.
                 parsed_data["drive_file_id"] = drive_file_id
+                # The Gmail message id lets the backend recognise an email it has
+                # already handled. This matters because the message is only marked
+                # read at the very end of process_message: if anything above throws,
+                # or the modify() call fails, the next poll picks the same message
+                # up again and every attachment in it is posted a second time.
+                parsed_data["gmail_message_id"] = msg_id
                 requests.post(f"{BACKEND_URL}/verification/invoice", json=parsed_data)
                 logger.info(f"Successfully processed {filename} and sent to Verification")
             else:

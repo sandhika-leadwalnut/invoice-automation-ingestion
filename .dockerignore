@@ -1,8 +1,11 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .git
 .gitignore
+*.md
+~$*
 # Note: It's best practice to ignore tokens and mount them at runtime!
 # If you want them baked into the image, remove these lines:
 .env
