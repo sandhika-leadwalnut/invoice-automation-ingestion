@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib
 import requests
 import logging
 from io import BytesIO
@@ -7,6 +8,10 @@ from googleapiclient.http import MediaIoBaseUpload
 from app.oauth import get_gmail_service, get_drive_service
 from app.parsers import parse_unstract_json
 from app.drive_folders import move_file_to_vendor_folder
+from app.convert import (
+    ConversionError, convert_to_pdf, is_supported, needs_conversion,
+    pdf_filename_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +21,11 @@ UNSTRACT_API_KEY = os.getenv("UNSTRACT_API_KEY")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 GMAIL_LABEL_ID = os.getenv("GMAIL_LABEL_ID")
 
+# Applied to emails that carried an attachment this service cannot read. The
+# invoice still is not processed, but somebody can see that it arrived - which
+# is the whole point. Optional: without it the skip is only logged.
+GMAIL_NEEDS_ATTENTION_LABEL_ID = os.getenv("GMAIL_NEEDS_ATTENTION_LABEL_ID")
+
 def poll_gmail_for_invoices():
     try:
         gmail_service = get_gmail_service()
@@ -24,7 +34,11 @@ def poll_gmail_for_invoices():
         logger.error(f"Failed to initialize Google API services: {e}")
         return
         
-    query = "has:attachment filename:pdf is:unread"
+    # Deliberately not filtered to PDFs any more. Narrowing the search here is
+    # what made a Word invoice vanish without trace - Gmail simply never
+    # returned the message, so nothing could report it. Everything with an
+    # attachment is fetched, and anything unusable is labelled below.
+    query = "has:attachment is:unread"
     
     try:
         results = gmail_service.users().messages().list(userId='me', q=query).execute()
@@ -43,6 +57,29 @@ def poll_gmail_for_invoices():
         except Exception as e:
             logger.error(f"Failed to process message {msg['id']}: {e}")
 
+def _flag_for_attention(gmail_service, msg_id: str, filenames):
+    """
+    Mark an email whose attachments this service could not read.
+
+    The message is left UNREAD on purpose. An invoice nobody can process should
+    keep sitting in the inbox looking like work, rather than being tidied away
+    into a label where it will never be looked at again.
+    """
+    logger.warning(
+        "Message %s carried attachments this service cannot read: %s",
+        msg_id, ", ".join(filenames),
+    )
+    if not GMAIL_NEEDS_ATTENTION_LABEL_ID:
+        return
+    try:
+        gmail_service.users().messages().modify(
+            userId='me', id=msg_id,
+            body={"addLabelIds": [GMAIL_NEEDS_ATTENTION_LABEL_ID]},
+        ).execute()
+    except Exception as e:
+        logger.error(f"Could not label message {msg_id} for attention: {e}")
+
+
 def process_message(msg_id: str, gmail_service, drive_service):
     message = gmail_service.users().messages().get(userId='me', id=msg_id).execute()
     
@@ -51,30 +88,65 @@ def process_message(msg_id: str, gmail_service, drive_service):
         # Check recursive payload parts if needed, but for now simple structure
         pass
         
-    pdf_attachments = []
-    
+    candidates = []      # (filename, bytes) this service can read
+    unreadable = []      # filenames it cannot, kept so the skip can be reported
+
     def extract_attachments(part_list):
         for part in part_list:
-            if part.get('filename') and part.get('filename').lower().endswith('.pdf'):
+            filename = part.get('filename')
+            if filename:
+                if not is_supported(filename):
+                    # Images, spreadsheets, signatures, inline logos. Recorded
+                    # rather than ignored so an invoice in an unexpected format
+                    # surfaces instead of disappearing.
+                    unreadable.append(filename)
+                    continue
                 attachment_id = part['body'].get('attachmentId')
                 if attachment_id:
                     attachment = gmail_service.users().messages().attachments().get(
                         userId='me', messageId=msg_id, id=attachment_id).execute()
                     data = base64.urlsafe_b64decode(attachment['data'])
-                    pdf_attachments.append((part['filename'], data))
+                    candidates.append((filename, data))
             elif part.get('parts'):
                 extract_attachments(part['parts'])
 
     # Recursively find parts if multiparts contain parts
     if 'parts' in message.get('payload', {}):
         extract_attachments(message['payload']['parts'])
-    
+
+    # Convert Word documents here, at the edge, so everything below this point
+    # deals only in PDFs. The ORIGINAL bytes are kept alongside: duplicate
+    # detection hashes those, never the conversion output, because LibreOffice
+    # embeds a timestamp and so produces a different PDF every run. Hashing the
+    # output would mean the same document never matched itself.
+    pdf_attachments = []
+    for filename, data in candidates:
+        if not needs_conversion(filename):
+            pdf_attachments.append((filename, data, hashlib.sha256(data).hexdigest()))
+            continue
+        try:
+            pdf_attachments.append((
+                pdf_filename_for(filename),
+                convert_to_pdf(filename, data),
+                hashlib.sha256(data).hexdigest(),
+            ))
+        except ConversionError as e:
+            logger.error(f"Could not convert {filename} in message {msg_id}: {e}")
+            unreadable.append(filename)
+
     if not pdf_attachments:
-        logger.info(f"No PDF attachments found in message {msg_id}")
+        logger.info(f"No readable invoice attachments in message {msg_id}")
+        if unreadable:
+            _flag_for_attention(gmail_service, msg_id, unreadable)
         return
-        
-    logger.info(f"Found {len(pdf_attachments)} PDF(s) in message {msg_id}")
-    
+
+    if unreadable:
+        # Some attachments worked and some did not. The message still gets
+        # labelled, because the ones that failed may themselves be invoices.
+        _flag_for_attention(gmail_service, msg_id, unreadable)
+
+    logger.info(f"Found {len(pdf_attachments)} invoice file(s) in message {msg_id}")
+
     # 3. Call the Invoice_counter backend
     metrics_payload = {
         "metrics_type": "invoice_email_metrics",
@@ -85,7 +157,7 @@ def process_message(msg_id: str, gmail_service, drive_service):
     except Exception as e:
         logger.error(f"Failed to post metrics: {e}")
 
-    for filename, pdf_data in pdf_attachments:
+    for filename, pdf_data, source_sha256 in pdf_attachments:
         parsed_data = None
 
         # 4. Upload file to Drive immediately, into the root folder.
@@ -143,6 +215,11 @@ def process_message(msg_id: str, gmail_service, drive_service):
                 # or the modify() call fails, the next poll picks the same message
                 # up again and every attachment in it is posted a second time.
                 parsed_data["gmail_message_id"] = msg_id
+                # Hash of the file as the vendor sent it. For a PDF this is the
+                # same thing the backend would compute; for a converted Word
+                # document it is the only stable fingerprint, since the PDF
+                # differs on every conversion.
+                parsed_data["source_sha256"] = source_sha256
                 requests.post(f"{BACKEND_URL}/verification/invoice", json=parsed_data)
                 logger.info(f"Successfully processed {filename} and sent to Verification")
             else:
