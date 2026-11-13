@@ -21,14 +21,36 @@ from datetime import datetime
 def startup_event():
     poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", 60))
     scheduler.add_job(
-        poll_gmail_for_invoices, 
-        'interval', 
+        poll_gmail_for_invoices,
+        'interval',
         seconds=poll_interval,
         id='poll_invoices',
         next_run_time=datetime.now()
     )
+
+    # Vendors who upload rather than email. Only scheduled when folders are
+    # configured, so an empty DRIVE_INBOX_FOLDERS costs nothing.
+    from app.drive_inbox import poll_drive_for_invoices, configured_folders
+    folders = configured_folders()
+    if folders:
+        scheduler.add_job(
+            poll_drive_for_invoices,
+            'interval',
+            seconds=poll_interval,
+            id='poll_drive_inbox',
+            next_run_time=datetime.now(),
+        )
+
     scheduler.start()
     logger.info(f"Started polling Gmail every {poll_interval} seconds")
+    if folders:
+        logger.info(
+            "Also polling %d Drive folder(s) every %ds: %s",
+            len(folders), poll_interval,
+            ", ".join(f.get("vendor") or f["folder_id"] for f in folders),
+        )
+    else:
+        logger.info("No Drive inbox folders configured (DRIVE_INBOX_FOLDERS)")
 
 
 @app.on_event("shutdown")

@@ -10,7 +10,15 @@ logger = logging.getLogger(__name__)
 
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
-    'https://www.googleapis.com/auth/drive.file'
+    'https://www.googleapis.com/auth/drive.file',
+    # drive.file reaches only files THIS app created, so an invoice a vendor
+    # uploaded to a folder they shared with us is invisible under it - not
+    # unreadable, invisible: it is not even listed. Reading those folders needs
+    # readonly, which is the narrowest scope that can see someone else's file.
+    #
+    # Adding a scope invalidates the existing token. token.json has to be
+    # deleted and the sign-in repeated, or every Google call starts failing.
+    'https://www.googleapis.com/auth/drive.readonly',
 ]
 
 # Relative paths for credentials

@@ -1,38 +1,24 @@
 import os
 import base64
-import hashlib
-import requests
 import logging
-from io import BytesIO
-from googleapiclient.http import MediaIoBaseUpload
+
 from app.oauth import get_gmail_service, get_drive_service
-from app.parsers import parse_unstract_json
-from app.drive_folders import move_file_to_vendor_folder
-from app.convert import (
-    ConversionError, convert_to_pdf, is_supported, needs_conversion,
-    pdf_filename_for,
+from app.convert import is_supported
+# Conversion, Drive filing, Unstract and the duplicate keys all live in the
+# pipeline now, shared with the Drive inbox. This module's only job is Gmail:
+# find the attachments, claim the message, hand each file over.
+from app.pipeline import (
+    DocumentSource, prepare, process_document, report_received,
 )
 
 logger = logging.getLogger(__name__)
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://192.168.200.11:8000")
-UNSTRACT_URL = os.getenv("UNSTRACT_URL")
-UNSTRACT_API_KEY = os.getenv("UNSTRACT_API_KEY")
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 GMAIL_LABEL_ID = os.getenv("GMAIL_LABEL_ID")
 
 # Applied to emails that carried an attachment this service cannot read. The
 # invoice still is not processed, but somebody can see that it arrived - which
 # is the whole point. Optional: without it the skip is only logged.
 GMAIL_NEEDS_ATTENTION_LABEL_ID = os.getenv("GMAIL_NEEDS_ATTENTION_LABEL_ID")
-
-# Every outbound call needs a deadline. A request without one waits forever,
-# and a call that never returns logs nothing at all - the file just disappears
-# between one log line and the next, which is how an invoice went missing with
-# no error anywhere. Unstract is given slightly longer than its own 300s limit
-# so its answer wins whenever it has one.
-UNSTRACT_TIMEOUT_SECONDS = int(os.getenv("UNSTRACT_TIMEOUT_SECONDS", "330"))
-HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
 
 def poll_gmail_for_invoices():
     try:
@@ -169,18 +155,11 @@ def process_message(msg_id: str, gmail_service, drive_service):
     # output would mean the same document never matched itself.
     pdf_attachments = []
     for filename, data in candidates:
-        if not needs_conversion(filename):
-            pdf_attachments.append((filename, data, hashlib.sha256(data).hexdigest()))
-            continue
-        try:
-            pdf_attachments.append((
-                pdf_filename_for(filename),
-                convert_to_pdf(filename, data),
-                hashlib.sha256(data).hexdigest(),
-            ))
-        except ConversionError as e:
-            logger.error(f"Could not convert {filename} in message {msg_id}: {e}")
+        ready = prepare(filename, data)
+        if ready is None:
             unreadable.append(filename)
+            continue
+        pdf_attachments.append(ready)
 
     if not pdf_attachments:
         logger.info(f"No readable invoice attachments in message {msg_id}")
@@ -210,114 +189,25 @@ def process_message(msg_id: str, gmail_service, drive_service):
     # while nobody notices.
     _claim_message(gmail_service, msg_id)
 
-    # 3. Call the Invoice_counter backend
-    metrics_payload = {
-        "metrics_type": "invoice_email_metrics",
-        "total_invoices_received": len(pdf_attachments)
-    }
-    try:
-        requests.post(f"{BACKEND_URL}/verification/email_metrics",
-                      json=metrics_payload, timeout=HTTP_TIMEOUT_SECONDS)
-    except Exception as e:
-        logger.error(f"Failed to post metrics: {e}")
+    report_received(len(pdf_attachments))
 
     failed = []
 
     for filename, pdf_data, source_sha256 in pdf_attachments:
-        parsed_data = None
-
-        # 4. Upload file to Drive immediately, into the root folder.
-        # The vendor is not known until Unstract has parsed the PDF, so the file
-        # is banked here first and re-parented into the vendor's folder in step 9.
-        # Uploading first means a parsing failure can never lose the document.
-        drive_file_id = None
-        try:
-            file_metadata = {
-                'name': filename,
-                'parents': [GOOGLE_DRIVE_FOLDER_ID]
-            }
-            media = MediaIoBaseUpload(BytesIO(pdf_data), mimetype='application/pdf', resumable=True)
-            created = drive_service.files().create(
-                body=file_metadata, media_body=media, fields='id'
-            ).execute()
-            drive_file_id = created.get('id')
-            logger.info(f"Uploaded {filename} to Google Drive ({drive_file_id})")
-        except Exception as e:
-            logger.error(f"Failed to upload {filename} to drive: {e}")
-
-        # 6. HTTP Request to Unstract
-        unstract_headers = {
-            "Authorization": f"Bearer {UNSTRACT_API_KEY}"
-        }
-        unstract_data = {
-            "timeout": "300",
-            "include_metadata": "False",
-            "include_metrics": "False"
-        }
-        unstract_files = {
-            "files": (filename, pdf_data, "application/pdf")
-        }
-
-        try:
-            logger.info(f"Sending {filename} to Unstract for parsing")
-            unstract_resp = requests.post(
-                UNSTRACT_URL,
-                headers=unstract_headers,
-                data=unstract_data,
-                files=unstract_files,
-                # Without this, requests waits forever. A hung call logged
-                # nothing at all - no success, no failure - so the file simply
-                # disappeared between "Sending to Unstract" and the next line
-                # of the log. Slightly longer than Unstract's own 300s limit so
-                # its answer wins when it has one.
-                timeout=UNSTRACT_TIMEOUT_SECONDS,
-            )
-            if unstract_resp.status_code == 200:
-                raw_json = unstract_resp.json()
-                # 7 & 8 Parse JSON and send to backend
-                parsed_data = parse_unstract_json(raw_json)
-                parsed_data["base64_pdf"] = base64.b64encode(pdf_data).decode('utf-8')
-                parsed_data["pdf_filename"] = filename
-                # Durable link between the invoice record and the Drive file.
-                # Filenames collide and get renamed; this id does not.
-                parsed_data["drive_file_id"] = drive_file_id
-                # The Gmail message id lets the backend recognise an email it has
-                # already handled - the last line of defence if claiming the
-                # message failed and it gets picked up a second time.
-                parsed_data["gmail_message_id"] = msg_id
-                # Hash of the file as the vendor sent it. For a PDF this is the
-                # same thing the backend would compute; for a converted Word
-                # document it is the only stable fingerprint, since the PDF
-                # differs on every conversion.
-                parsed_data["source_sha256"] = source_sha256
-                requests.post(f"{BACKEND_URL}/verification/invoice",
-                              json=parsed_data, timeout=HTTP_TIMEOUT_SECONDS)
-                logger.info(f"Successfully processed {filename} and sent to Verification")
-            else:
-                logger.error(f"Unstract failed for {filename}: {unstract_resp.status_code} - {unstract_resp.text}")
-                failed.append(filename)
-        except Exception as e:
-            logger.error(f"Error calling Unstract or sending to Verification for {filename}: {e}")
+        # One shared pipeline for Gmail and the Drive inbox. Everything from
+        # here - Drive filing, Unstract, the duplicate keys - is identical
+        # whatever brought the file in, and keeping two copies of it is how
+        # the n8n and service paths ended up storing different shapes.
+        if not process_document(
+            drive_service, filename, pdf_data, source_sha256,
+            DocumentSource(label=f"gmail:{msg_id}", gmail_message_id=msg_id),
+        ):
             failed.append(filename)
 
-        # 9. Now that the vendor is known, move the file into its folder.
-        # Skipped entirely if the upload failed or parsing produced no vendor -
-        # in that case the file simply stays in the root folder.
-        if drive_file_id and parsed_data:
-            try:
-                move_file_to_vendor_folder(
-                    drive_service,
-                    drive_file_id,
-                    gstin=parsed_data.get("vendor_gstin"),
-                    vendor_name=parsed_data.get("vendor_name"),
-                    vendor_id=parsed_data.get("vendor_id"),
-                )
-            except Exception as e:
-                logger.error(f"Failed to file {filename} under its vendor folder: {e}")
-
-    # The message was claimed before the loop, so there is nothing to mark here.
-    # What is left is to say so when some of it did not work: the message will
-    # NOT be retried, which is the point, so a failure that nobody is told about
-    # is a lost invoice.
+    # The message was claimed before the loop, so there is nothing to mark
+    # here. What is left is to say so when some of it did not work: the message
+    # will NOT be retried, which is the point, so a failure nobody is told
+    # about is a lost invoice.
     if failed:
         _flag_for_attention(gmail_service, msg_id, failed)
+    return
